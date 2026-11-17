@@ -9,7 +9,8 @@ def mock_configuration():
         'models': [{'id': 'mock/' + alias, 'provider': 'mock', 'model': model,
                     'apis': ['openai', 'anthropic'], 'context': 32768, 'output': output}
                    for alias, model, output in [('fixture', 'fixture', 4096),
-                                                ('demo-cheap', 'fixture-cheap', 2048)]]}
+                                                ('demo-cheap', 'fixture-cheap', 2048),
+                                                ('demo-free', 'fixture-free', 2048)]]}
 
 
 def native_inputs(document):

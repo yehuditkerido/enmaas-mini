@@ -16,6 +16,7 @@ import unicodedata
 from urllib.parse import parse_qsl, quote, unquote, urlsplit, urlunsplit
 
 from gateway import render
+from switchyard_config import load_private as load_switchyard
 
 ROOT = Path(__file__).resolve().parents[2]
 POSTGRES = 'docker.io/library/postgres@sha256:996e9dc583ba9f0265a2c75547a9c95fb22c251e394749cab205a0a00e1856a1'
@@ -207,6 +208,7 @@ def gateway_quadlet_body(image, provider_secrets, mount, mock_provider):
         + mock_network
         + 'Secret=pricetag-m2m,type=mount,target=/run/secrets/pricetag-m2m,uid=1001,gid=1001,mode=0400\n'
         + 'PublishPort=0.0.0.0:8443:8443\n'
+        + 'PublishPort=0.0.0.0:8444:8444\n'
         + '\n'.join(provider_secrets) + '\n'
         + mount + 'Exec=-c /etc/praxis/gateway.json\n'
     )
@@ -240,6 +242,8 @@ def main():
                         help='CA certificate used when the external URL sets sslmode=verify-full')
     parser.add_argument('--price-sources', type=Path, required=True,
                         help='JSON mapping gateway aliases to reviewed PriceTag pricing model IDs')
+    parser.add_argument('--switchyard-config', type=Path,
+                        help='root-owned JSON selection for the optional Chat Completions autorouter')
     parser.add_argument('--directory', type=Path, default=Path('/etc/praxis-pricetag'))
     parser.add_argument('--admin-directory', type=Path, default=Path('/root/pricetag-admin'))
     args = parser.parse_args()
@@ -276,8 +280,14 @@ def main():
         original = json.loads(args.providers.read_text())
     if args.vllm_only:
         original, models = vllm_only(original, models)
+    try:
+        switchyard = (load_switchyard(args.switchyard_config, models)
+                      if args.switchyard_config is not None else None)
+    except ValueError as error:
+        parser.error(str(error))
     config = render(original, models,
-                    list(dict.fromkeys([f'https://{args.hostname}:8443', 'https://localhost:8443'])))
+                    list(dict.fromkeys([f'https://{args.hostname}:8443', 'https://localhost:8443'])),
+                    switchyard=switchyard)
     sources = json.loads(args.price_sources.read_text())
     if not isinstance(sources, dict) or any(not isinstance(v, str) for v in sources.values()):
         parser.error('price-sources must map aliases to model names')
@@ -378,6 +388,13 @@ def main():
     (args.directory / 'management-secret').write_text(management_secret + '\n')
     (args.directory / 'bootstrap.json').write_text(json.dumps({'models': models, 'sources': sources, 'monthly_usd': args.monthly_usd}) + '\n')
     (args.directory / 'models.json').write_text(json.dumps(models, indent=2) + '\n')
+    # Mock installs have no provider-controller state directory.  Retain the
+    # non-secret native inputs so the dedicated Switchyard controller can
+    # regenerate the same gateway shape in either installation mode.
+    (args.directory / 'provider-inputs.json').write_text(json.dumps(original, indent=2) + '\n')
+    # The dedicated Switchyard controller replaces this regular state file in
+    # the same restart/readiness/rollback transaction as gateway.json.
+    (args.directory / 'switchyard.json').write_text(json.dumps(switchyard or {}, indent=2) + '\n')
     catalog = args.directory / 'catalog'
     catalog.mkdir(mode=0o750)
     (catalog / 'models.json').write_text(json.dumps([{k: m[k] for k in ('id', 'model', 'provider')} for m in models]) + '\n')

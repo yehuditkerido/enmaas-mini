@@ -1,0 +1,7 @@
+{
+  "alias": "autorouter",
+  "judge": "mock/demo-free",
+  "weak": "mock/demo-cheap",
+  "strong": "mock/fixture",
+  "fallback_model": "mock/demo-free"
+}

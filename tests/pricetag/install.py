@@ -112,6 +112,10 @@ class InstallTest(unittest.TestCase):
 
     def test_published_defaults_and_optional_source_branches(self):
         args = self.image_args()
+        self.assertEqual(installer.PRAXIS_IMAGE,
+                         'ghcr.io/praxis-proxy/experimental@sha256:'
+                         '3f4248112824dc0e7f518d5c53fec75a875e6dc5d5fc64a19b3eb4f9c8d50e2a')
+        self.assertEqual(installer.PRAXIS_REVISION, '655c63a9c947dcaf94606fda49514007a81b9ec6')
         self.assertEqual(args.image_mode, 'published')
         self.assertEqual(args.metering_image, installer.PUBLISHED_METERING_IMAGE)
         self.assertEqual(args.maas_image, installer.PUBLISHED_MAAS_IMAGE)

@@ -24,7 +24,7 @@ sudo scripts/common/install --prepare
 Pull the same digest-pinned images as the installer:
 
 ```console
-PRAXIS_REF=quay.io/opendatahub/praxis-experimental@sha256:502f120fed7b8e516ce1d78396045c8f72673672351432b9dc2e61baf5c13ac8
+PRAXIS_REF=ghcr.io/praxis-proxy/experimental@sha256:3f4248112824dc0e7f518d5c53fec75a875e6dc5d5fc64a19b3eb4f9c8d50e2a
 MAAS_REF=quay.io/redhat-et/secure-single-server-maas-standalone@sha256:0bec6ef57fa5b10a7bef8f4df8d98f932c9d7fc96798f7bfc0cd77b504790fa8
 METERING_REF=quay.io/redhat-et/secure-single-server-pricetag-metering@sha256:dabb2f35f54c30c2c387b3bf298b66f3b84a4110ddf3a78a204c7d59c5de2f1a
 (

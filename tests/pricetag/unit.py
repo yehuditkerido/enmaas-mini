@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import subprocess
@@ -22,6 +23,7 @@ client = importlib.util.module_from_spec(spec)
 loader.exec_module(client)
 sys.path.insert(0, str(ROOT / 'scripts/pricetag'))
 import prepare
+import switchyard_config
 network_loader = importlib.machinery.SourceFileLoader(
     'pricetag_private_network', str(ROOT / 'scripts/pricetag/private-network.py'))
 network_spec = importlib.util.spec_from_loader(network_loader.name, network_loader)
@@ -44,6 +46,137 @@ external_database_loader.exec_module(external_database)
 
 
 class PreparationTest(unittest.TestCase):
+    def test_switchyard_selection_accepts_existing_openai_models_only(self):
+        _, models = prepare.mock_inputs(managed=True)
+        for filename, expected_fallback in (
+                ('switchyard-poc-mock-no-fallback.json', False),
+                ('switchyard-poc-mock-with-free-fallback.json', True)):
+            with self.subTest(filename=filename):
+                settings_path = ROOT / 'configs/pricetag' / filename
+                self.assertEqual(switchyard_config.load(settings_path, models)['fallback'], expected_fallback)
+        settings = switchyard_config.validate({
+            'alias': 'autorouter', 'judge': 'mock/fixture',
+            'weak': 'mock/demo-cheap', 'strong': 'mock/fixture',
+        }, models)
+        self.assertEqual(settings['alias'], 'autorouter')
+        self.assertEqual(settings['weak']['model'], 'fixture-cheap')
+        self.assertFalse(settings['fallback'])
+        original, _ = prepare.mock_inputs(managed=True)
+        # prepare.py and the dedicated controller pass the saved normalized
+        # state back into the renderer, rather than the administrator's raw
+        # ID-only document.
+        self.assertTrue(any(item['filter'] == 'switchyard_route'
+                            for chain in prepare.render(original, models, switchyard=settings)['filter_chains']
+                            for item in chain['filters']))
+        settings = switchyard_config.validate({
+            'alias': 'autorouter', 'judge': 'mock/fixture',
+            'weak': 'mock/demo-cheap', 'strong': 'mock/fixture',
+            'fallback_model': 'mock/demo-free',
+        }, models)
+        self.assertTrue(settings['fallback'])
+        self.assertEqual(settings['fallback_model']['id'], 'mock/demo-free')
+        with self.assertRaisesRegex(ValueError, 'must differ'):
+            switchyard_config.validate({
+                'alias': 'autorouter', 'judge': 'mock/fixture',
+                'weak': 'mock/demo-cheap', 'strong': 'mock/fixture',
+                'fallback_model': 'mock/demo-cheap',
+            }, models)
+
+    def test_switchyard_selection_rejects_alias_collisions_and_unsupported_models(self):
+        _, models = prepare.mock_inputs(managed=True)
+        base = {'alias': 'autorouter', 'judge': 'mock/fixture',
+                'weak': 'mock/demo-cheap', 'strong': 'mock/fixture'}
+        with self.assertRaisesRegex(ValueError, 'conflicts'):
+            switchyard_config.validate({**base, 'alias': 'mock/fixture'}, models)
+        with self.assertRaisesRegex(ValueError, 'existing model ID'):
+            switchyard_config.validate({**base, 'strong': 'missing'}, models)
+        anthropic_only = copy.deepcopy(models)
+        anthropic_only[1]['apis'] = ['anthropic']
+        with self.assertRaisesRegex(ValueError, 'OpenAI-compatible'):
+            switchyard_config.validate(base, anthropic_only)
+        other_provider = copy.deepcopy(models)
+        other_provider[1]['provider'] = 'other'
+        with self.assertRaisesRegex(ValueError, 'one existing provider'):
+            switchyard_config.validate(base, other_provider)
+
+    def test_switchyard_private_selection_rejects_untrusted_files_and_reads_verified_descriptor(self):
+        _, models = prepare.mock_inputs(managed=True)
+        document = json.dumps({'alias': 'autorouter', 'judge': 'mock/demo-free',
+                               'weak': 'mock/demo-cheap', 'strong': 'mock/fixture'})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'switchyard.json'
+            path.write_text(document)
+            path.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, 'root-owned private'):
+                switchyard_config.load_private(path, models)
+            trusted = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0)
+            with patch.object(switchyard_config.os, 'fstat', return_value=trusted):
+                settings = switchyard_config.load_private(path, models)
+        self.assertEqual(settings['judge']['id'], 'mock/demo-free')
+
+    def test_switchyard_autorouter_is_chat_only_and_meters_selected_model(self):
+        original, models = prepare.mock_inputs(managed=True)
+        rendered = prepare.render(original, models, switchyard={
+            'alias': 'autorouter', 'judge': 'mock/fixture',
+            'weak': 'mock/demo-cheap', 'strong': 'mock/fixture',
+        })
+        catalog = next(item for item in next(chain for chain in rendered['filter_chains']
+                                              if chain['name'] == 'switchyard-openai')['filters']
+                       if item.get('filter') == 'static_response' and item.get('status') == 200)
+        self.assertIn('autorouter', [item['id'] for item in json.loads(catalog['body'])['data']])
+        chain = next(chain['filters'] for chain in rendered['filter_chains'] if chain['name'] == 'switchyard-openai')
+        access = next(item for item in chain if item['filter'] == 'model_access')
+        # Switchyard rewrites autorouter to its selected target before the
+        # PriceTag access check.  Those target names are internal allowlist
+        # entries; the following original-model guard still limits callers to
+        # the public alias.
+        self.assertEqual(access['models'], ['autorouter', 'fixture', 'fixture-cheap'])
+        unknown = next(item for item in chain
+                       if item.get('filter') == 'static_response' and item.get('body') == 'Unknown model')
+        self.assertEqual(unknown['conditions'],
+                         [{'unless': {'headers': {'X-Gateway-Model': 'autorouter'}}}])
+        route = next(item for item in chain if item['filter'] == 'switchyard_route')
+        self.assertEqual(route['conditions'], [{'when': {'path': '/v1/chat/completions'}}])
+        self.assertEqual(route['targets']['weak'], {'cluster': 'mock-openai', 'model': 'fixture-cheap'})
+        self.assertEqual(route['targets']['strong'], {'cluster': 'mock-openai', 'model': 'fixture'})
+        meter = next(item for item in chain if item['filter'] == 'external_metering')
+        rate_limit = next(item for item in chain if item['filter'] == 'rate_limit')
+        self.assertEqual(rate_limit, {'filter': 'rate_limit', 'mode': 'global', 'rate': 30, 'burst': 120})
+        self.assertLess(chain.index(rate_limit), chain.index(route))
+        self.assertLess(chain.index(route), chain.index(meter))
+        self.assertFalse(any(item['filter'] == 'intelligent_route' for item in chain))
+        self.assertEqual(sum(item['filter'] in ('switchyard_route', 'intelligent_route') for item in chain), 1)
+        direct = next(chain['filters'] for chain in rendered['filter_chains'] if chain['name'] == 'openai')
+        self.assertEqual(sum(item['filter'] == 'intelligent_route' for item in direct), 1)
+        self.assertNotIn('autorouter', next(item for item in direct if item['filter'] == 'model_access')['models'])
+        chat_only = next(item for item in chain if item.get('body') == 'Unsupported API path')
+        self.assertEqual(chat_only['conditions'], [{'unless': {'path': '/v1/chat/completions'}}])
+        listener = next(item for item in rendered['listeners'] if item['name'] == 'switchyard-openai')
+        self.assertEqual(listener['address'], '0.0.0.0:8444')
+
+    def test_switchyard_free_fallback_is_exactly_one_unmetered_second_step(self):
+        original, models = prepare.mock_inputs(managed=True)
+        rendered = prepare.render(original, models, switchyard={
+            'alias': 'autorouter', 'judge': 'mock/fixture',
+            'weak': 'mock/demo-cheap', 'strong': 'mock/fixture',
+            'fallback_model': 'mock/demo-free',
+        })
+        chain = next(chain['filters'] for chain in rendered['filter_chains'] if chain['name'] == 'switchyard-openai')
+        access = next(item for item in chain if item['filter'] == 'model_access')
+        self.assertEqual(access['models'], ['autorouter', 'fixture', 'fixture-cheap', 'fixture-free'])
+        router = next(item for item in chain if item['filter'] == 'iterative_request_router')
+        self.assertEqual(router['conditions'], [{'when': {'path': '/v1/chat/completions'}}])
+        self.assertEqual(router['max_iterations'], 2)
+        primary, free = router['steps']
+        self.assertEqual(primary['name'], 'primary')
+        self.assertEqual([item['filter'] for item in primary['filters'][:4]],
+                         ['api_key_auth', 'identity_header_guard', 'switchyard_route', 'external_metering'])
+        self.assertIn({'origin': 'local', 'status': [429], 'next': 'free'}, primary['on_result'])
+        self.assertEqual(free['name'], 'free')
+        self.assertEqual([item['filter'] for item in free['filters']].count('external_metering'), 0)
+        self.assertEqual(free['filters'][0], {
+            'filter': 'switchyard_failure_target', 'cluster': 'mock-openai', 'model': 'fixture-free'})
+
     def test_routing_requests_are_paced_without_retries(self):
         spec = importlib.util.spec_from_file_location('paced_routing', ROOT / 'tests/pricetag/rhel-routing.py')
         routing = importlib.util.module_from_spec(spec)
@@ -141,7 +274,7 @@ class PreparationTest(unittest.TestCase):
 
     def test_managed_mock_supports_authenticated_ui_routes(self):
         original, models = prepare.mock_inputs(managed=True)
-        self.assertEqual([m['id'] for m in models], ['mock/fixture', 'mock/demo-cheap'])
+        self.assertEqual([m['id'] for m in models], ['mock/fixture', 'mock/demo-cheap', 'mock/demo-free'])
         self.assertTrue(all(m['provider'] == 'mock' for m in models))
         result = prepare.render(original, models)
         for chain in result['filter_chains']:
@@ -373,6 +506,7 @@ class PreparationTest(unittest.TestCase):
         body = prepare.gateway_quadlet_body('sha256:' + 'a' * 64, [], 'Volume=/tmp/pricetag-fixture:/etc/praxis:ro,Z\n', True)
         for required in ('Image=sha256:', 'Pull=never', 'NetworkAlias=pricetag-gateway',
                          'Secret=pricetag-m2m,', 'PublishPort=0.0.0.0:8443:8443',
+                         'PublishPort=0.0.0.0:8444:8444',
                          'Network=pricetag-mock.network', 'Volume=/tmp/pricetag-fixture:/etc/praxis:ro,Z',
                          'Exec=-c /etc/praxis/gateway.json'):
             self.assertIn(required, body)

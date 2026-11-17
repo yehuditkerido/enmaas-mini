@@ -78,7 +78,7 @@ def main():
     except urllib.error.HTTPError as error:
         if error.code != 302 or not any(c.name == 'metering_session' for c in jar):
             raise ValueError('administrator login failed') from None
-    expected = {'mock/fixture', 'mock/demo-cheap'}
+    expected = {'mock/fixture', 'mock/demo-cheap', 'mock/demo-free'}
     if not expected <= {m['id'] for m in json.loads((deploy / 'models.json').read_text())}:
         raise ValueError('install the synthetic demo provider configuration first')
     if args.resume or args.cleanup:

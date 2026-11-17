@@ -25,8 +25,11 @@ MAAS_REPO = 'https://github.com/Ladas/models-as-a-service.git'
 MAAS_BRANCH = 'feat/standalone-runtime-minimal'
 METERING_REPO = 'https://github.com/Ladas/pricetag-metering.git'
 METERING_BRANCH = 'feat/latest-upstream-standalone'
-PRAXIS_IMAGE = 'quay.io/opendatahub/praxis-experimental@sha256:502f120fed7b8e516ce1d78396045c8f72673672351432b9dc2e61baf5c13ac8'
-PRAXIS_REVISION = '5667c4acecd0981ae5114cbbf2ee3dcccec9c248'
+# Published multi-architecture image built from the merged Switchyard +
+# PriceTag demo commit.  Keep the manifest-list digest and verify its source
+# label during installation; never follow the mutable :main tag.
+PRAXIS_IMAGE = 'ghcr.io/praxis-proxy/experimental@sha256:3f4248112824dc0e7f518d5c53fec75a875e6dc5d5fc64a19b3eb4f9c8d50e2a'
+PRAXIS_REVISION = '655c63a9c947dcaf94606fda49514007a81b9ec6'
 MAAS_IMAGE = 'localhost/pricetag-maas:standalone'
 METERING_IMAGE = 'localhost/pricetag-metering:upstream-b1c5ce0'
 PUBLISHED_MAAS_IMAGE = 'quay.io/redhat-et/secure-single-server-maas-standalone@sha256:0bec6ef57fa5b10a7bef8f4df8d98f932c9d7fc96798f7bfc0cd77b504790fa8'
@@ -178,7 +181,7 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--mode', choices=('real', 'mock'), default='real',
                    help='real providers (default); use mock for synthetic benchmarks')
-    p.add_argument('--demo-fixture', action='store_true', help='mock mode only: two model aliases for the UI demo')
+    p.add_argument('--demo-fixture', action='store_true', help='mock mode only: three model aliases for the UI demo')
     p.add_argument('--hostname', help='public IPv4 or DNS name; no scheme, path or port')
     p.add_argument('--provider', action='append', choices=('openai', 'external', 'pricetag'), default=[],
                    help='real mode requires one or more providers; pricetag is the legacy external profile')
@@ -193,6 +196,8 @@ def parse_args(argv=None):
     p.add_argument('--pricetag-messages-url', help=argparse.SUPPRESS)
     p.add_argument('--pricetag-openai-url', help=argparse.SUPPRESS)
     p.add_argument('--monthly-usd', type=int, default=5, help='default per-user monthly USD allowance; default 5')
+    p.add_argument('--switchyard-config', type=Path,
+                   help='root-owned JSON enabling the Chat Completions autorouter with judge/Weak/Strong selections')
     p.add_argument('--maas-database-url-file', type=Path,
                    help='private URL file for the existing external maas database')
     p.add_argument('--metering-database-url-file', type=Path,
@@ -220,6 +225,8 @@ def parse_args(argv=None):
         p.error('provide --hostname with a valid IPv4 or DNS name')
     if not 1 <= args.monthly_usd <= 10000:
         p.error('--monthly-usd must be 1–10000')
+    if args.switchyard_config is not None and not args.switchyard_config.is_absolute():
+        p.error('--switchyard-config must be an absolute path')
     if args.maas_database_url_file is not None or args.metering_database_url_file is not None:
         if args.maas_database_url_file is None or args.metering_database_url_file is None:
             p.error('external databases require both --maas-database-url-file and --metering-database-url-file')
@@ -240,6 +247,8 @@ def parse_args(argv=None):
             p.error('real mode requires --provider openai and/or --provider external')
     if args.demo_fixture and args.mode != 'mock':
         p.error('--demo-fixture requires --mode mock')
+    if args.switchyard_config is not None and args.mode == 'mock' and not args.demo_fixture:
+        p.error('--switchyard-config in mock mode requires --demo-fixture')
     if args.mode == 'mock' and args.provider:
         p.error('mock mode cannot configure real providers')
     if 'external' in args.provider and not args.external_api:
@@ -395,7 +404,8 @@ def acquire_images(args, arch):
 
 def install(args):
     sys.path.insert(0, str(ROOT / 'scripts/pricetag'))
-    from prepare import POSTGRES, validate_external_database_urls
+    from prepare import POSTGRES, mock_inputs, validate_external_database_urls
+    from switchyard_config import load_private as load_switchyard
     apis = {'openai': 'OpenAI-compatible', 'anthropic': 'Anthropic Messages',
             'both': 'OpenAI-compatible + Anthropic Messages'}
     providers = {'openai': 'OpenAI', 'external': 'External (' + apis.get(args.external_api, 'both APIs') + ')',
@@ -417,6 +427,8 @@ def install(args):
         print('  PriceTag ref ' + (args.metering_branch or args.metering_revision))
     print('  Users      ' + ('admin, alice, bob' if args.sample_users else 'admin only'))
     print(f'  Budget     ${args.monthly_usd}/month per ordinary user')
+    if args.switchyard_config is not None:
+        print('  Switchyard selection  ' + str(args.switchyard_config))
     print('\n  1. Validate provider setup   4. Import images')
     print('  2. Prepare RHEL             5. Configure gateway')
     print('  3. Build/pull images        6. Start and verify services')
@@ -435,6 +447,13 @@ def install(args):
     helper = provider_module()
     stage(1, 'Validate provider setup')
     prepared = collect_providers(args, helper)
+    if args.switchyard_config is not None:
+        # Reject a bad selection before provider secrets or host files are
+        # created. Mock POC selection is available only with the managed
+        # multi-model fixture, which also supplies the existing mock key.
+        models = (mock_inputs(managed=args.demo_fixture)[1] if args.mode == 'mock'
+                  else [model for _, settings, _ in prepared for model in settings['models']])
+        load_switchyard(args.switchyard_config, models)
     print('\nSetup validated. Ready to install the configuration above.')
     if not args.yes and input('Install on this host? Type install: ').strip() != 'install':
         raise ValueError('installation cancelled')
@@ -474,6 +493,8 @@ def install(args):
             command += ['--external-database-ca-file', args.external_database_ca_file]
     if not args.sample_users:
         command += ['--no-sample-users']
+    if args.switchyard_config is not None:
+        command += ['--switchyard-config', args.switchyard_config]
     if args.mode == 'mock':
         command += ['--mock-provider', '--price-sources', ROOT / 'configs/pricetag/perf-price-sources.json']
         if args.demo_fixture:

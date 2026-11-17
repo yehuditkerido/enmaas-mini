@@ -21,6 +21,7 @@ loader.exec_module(setup)
 sys.path.insert(0, str(ROOT / 'scripts/common'))
 sys.path.insert(0, str(ROOT / 'scripts/pricetag'))
 from gateway import render as gateway
+from switchyard_config import validate as validate_switchyard
 
 
 class SetupTest(unittest.TestCase):
@@ -345,6 +346,92 @@ class SetupTest(unittest.TestCase):
         clusters = updated['filter_chains'][0]['filters'][0]['clusters']
         self.assertEqual(clusters[0]['endpoints'], ['api.openai.com:443'])
         self.assertEqual(clusters[1]['endpoints'], ['untouched:443'])
+
+    def test_replacement_rerenders_active_switchyard_routes(self):
+        """An endpoint rotation updates both direct and autorouter routes."""
+        original, models = __import__('prepare').mock_inputs(managed=True)
+        settings = validate_switchyard({
+            'alias': 'autorouter', 'judge': 'mock/demo-free',
+            'weak': 'mock/demo-cheap', 'strong': 'mock/fixture',
+        }, models)
+        self.assert_switchyard_replacement(original, models, settings, fallback=False)
+
+    def test_replacement_rerenders_active_switchyard_fallback_steps(self):
+        """Nested primary/free fallback load balancers follow endpoint rotation too."""
+        original, models = __import__('prepare').mock_inputs(managed=True)
+        settings = validate_switchyard({
+            'alias': 'autorouter', 'judge': 'mock/demo-free',
+            'weak': 'mock/demo-cheap', 'strong': 'mock/fixture',
+            'fallback_model': 'mock/demo-free',
+        }, models)
+        self.assert_switchyard_replacement(original, models, settings, fallback=True)
+
+    def test_refresh_rejects_removing_a_model_selected_by_switchyard(self):
+        original, models = __import__('prepare').mock_inputs(managed=True)
+        switchyard = validate_switchyard({
+            'alias': 'autorouter', 'judge': 'mock/demo-free',
+            'weak': 'mock/demo-cheap', 'strong': 'mock/fixture',
+        }, models)
+        replacement = {'models': [{
+            'id': 'mock/new', 'provider': 'mock', 'model': 'new',
+            'apis': ['openai'], 'context': 32768, 'output': 2048,
+        }], 'urls': {'openai': 'https://replacement.example/v1'}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            deploy, state = root / 'deploy', root / 'inputs'
+            (deploy / 'gateway').mkdir(parents=True)
+            state.mkdir()
+            (deploy / 'models.json').write_text(json.dumps(models))
+            (deploy / 'switchyard.json').write_text(json.dumps(switchyard))
+            (deploy / 'gateway/gateway.json').write_text(json.dumps(gateway(original, models, switchyard=switchyard)))
+            (state / 'providers.json').write_text(json.dumps(original))
+            with patch.object(setup, 'DEPLOY', deploy), patch.object(setup, 'STATE', state):
+                with self.assertRaisesRegex(ValueError, 'existing model ID'):
+                    setup.refresh_model_files(replacement, name='mock')
+
+    def assert_switchyard_replacement(self, original, models, switchyard, fallback):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            deploy, state, units = root / 'deploy', root / 'inputs', root / 'units'
+            (deploy / 'gateway').mkdir(parents=True)
+            state.mkdir()
+            (units / '1001').mkdir(parents=True)
+            (deploy / 'models.json').write_text(json.dumps(models))
+            (deploy / 'switchyard.json').write_text(json.dumps(switchyard))
+            (deploy / 'gateway/gateway.json').write_text(json.dumps(gateway(original, models, switchyard=switchyard)))
+            (state / 'providers.json').write_text(json.dumps(original))
+            quadlet = 'Secret=old-secret,type=env,target=CUSTOM_MOCK_API_KEY\n'
+            for path in (deploy / 'quadlets/pricetag-gateway.container',
+                         units / '1001/pricetag-gateway.container',
+                         state / 'provider-secrets.container'):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(quadlet)
+            replacement = {'models': models, 'urls': {'openai': 'https://replacement.example/v1'},
+                           'secret': 'new-secret'}
+            with patch.object(setup, 'DEPLOY', deploy), patch.object(setup, 'STATE', state), \
+                    patch.object(setup, 'USER_UNITS', units), \
+                    patch.object(setup.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=1001)):
+                files = setup.replacement_files(replacement, name='mock')
+        updated = json.loads(files[deploy / 'gateway/gateway.json'])
+        direct = next(c['filters'] for c in updated['filter_chains'] if c['name'] == 'openai')
+        direct_load_balancer = next(item for item in direct if item['filter'] == 'load_balancer')
+        direct_cluster = next(c for c in direct_load_balancer['clusters'] if c['name'] == 'mock-openai')
+        self.assertEqual(direct_cluster['endpoints'], ['replacement.example:443'])
+        chain = next(c['filters'] for c in updated['filter_chains'] if c['name'] == 'switchyard-openai')
+        if fallback:
+            router = next(item for item in chain if item['filter'] == 'iterative_request_router')
+            load_balancers = [item for step in router['steps'] for item in step['filters']
+                              if item['filter'] == 'load_balancer']
+            self.assertEqual(len(load_balancers), 2)
+            for load_balancer in load_balancers:
+                cluster = next(c for c in load_balancer['clusters'] if c['name'] == 'mock-openai')
+                self.assertEqual(cluster['endpoints'], ['replacement.example:443'])
+        else:
+            route = next(item for item in chain if item['filter'] == 'switchyard_route')
+            self.assertEqual(route['judge']['endpoint'], 'https://replacement.example/v1/chat/completions')
+            load_balancer = next(item for item in chain if item['filter'] == 'load_balancer')
+            cluster = next(c for c in load_balancer['clusters'] if c['name'] == 'mock-openai')
+            self.assertEqual(cluster['endpoints'], ['replacement.example:443'])
 
     def test_inference_diagnostic_bounds_request_and_redacts_errors(self):
         requests = []

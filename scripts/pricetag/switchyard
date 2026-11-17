@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Manage the optional PriceTag Switchyard autorouter configuration.
+
+This controller deliberately owns Switchyard selection only.  Provider
+credentials and direct-model routes remain managed by scripts/pricetag/providers.
+Every change restarts Praxis and uses that controller's readiness/rollback
+transaction; it does not claim to hot-reload a running gateway.
+"""
+import argparse
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import pwd
+import sys
+
+ROOT = Path(__file__).resolve().parents[2]
+DEPLOY = Path('/etc/praxis-pricetag')
+STATE = Path('/root/pricetag-provider-inputs')
+
+
+def provider_controller():
+    loader = importlib.machinery.SourceFileLoader('pricetag_providers', str(ROOT / 'scripts/pricetag/providers'))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def replacement_files(settings):
+    """Render the gateway, its listener publication and durable selection."""
+    sys.path.insert(0, str(ROOT / 'scripts/pricetag'))
+    from gateway import render
+    source = STATE / 'providers.json'
+    if not source.is_file():
+        source = DEPLOY / 'provider-inputs.json'
+    providers = json.loads(source.read_text())
+    models = json.loads((DEPLOY / 'models.json').read_text())
+    gateway = render(providers, models, switchyard=settings)
+    values = {
+        DEPLOY / 'gateway/gateway.json': gateway,
+        DEPLOY / 'switchyard.json': settings or {},
+    }
+    # The alias has a dedicated listener so it never shares a pipeline with
+    # direct-model intelligent routing.  Make an older prepared deployment
+    # upgrade its Quadlet atomically with gateway.json as well.
+    uid = pwd.getpwnam('praxis-svc').pw_uid
+    for path in (DEPLOY / 'quadlets/pricetag-gateway.container',
+                 Path('/etc/containers/systemd/users') / str(uid) / 'pricetag-gateway.container'):
+        lines = path.read_text().splitlines()
+        primary = [index for index, line in enumerate(lines) if line == 'PublishPort=0.0.0.0:8443:8443']
+        alias = [index for index, line in enumerate(lines) if line == 'PublishPort=0.0.0.0:8444:8444']
+        if len(primary) != 1 or len(alias) > 1:
+            raise ValueError('unexpected gateway HTTPS publication in ' + str(path))
+        if not alias:
+            lines.insert(primary[0] + 1, 'PublishPort=0.0.0.0:8444:8444')
+        values[path] = ('\n'.join(lines) + '\n').encode()
+    return {path: (value if isinstance(value, bytes) else
+                   (json.dumps(value, indent=2) + '\n').encode())
+            for path, value in values.items()}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=('set', 'disable', 'show'))
+    parser.add_argument('--config', type=Path,
+                        help='root-owned JSON with alias, judge, weak, strong and optional fallback_model')
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        parser.error('run as root on the RHEL host')
+    if args.command == 'set' and args.config is None:
+        parser.error('set requires --config')
+    if args.command != 'set' and args.config is not None:
+        parser.error('--config is only valid with set')
+    if args.command == 'show':
+        try:
+            print((DEPLOY / 'switchyard.json').read_text(), end='')
+        except OSError as error:
+            raise SystemExit('Switchyard controller stopped: ' + str(error)) from None
+        return
+    if not (DEPLOY / 'bootstrap.done').is_file():
+        raise SystemExit('Switchyard controller stopped: complete the PriceTag installation first')
+    try:
+        settings = None
+        if args.command == 'set':
+            sys.path.insert(0, str(ROOT / 'scripts/pricetag'))
+            from switchyard_config import load_private
+            settings = load_private(args.config, json.loads((DEPLOY / 'models.json').read_text()))
+        # Share the provider controller's lock when it exists so endpoint and
+        # Switchyard changes cannot race.  Mock-only installations have no
+        # provider state, so retain an equivalent deployment-local lock.
+        lock_path = (STATE / '.setup.lock') if STATE.is_dir() else (DEPLOY / '.switchyard.lock')
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError('another PriceTag configuration update is running') from None
+            files = replacement_files(settings)
+            provider_controller().install_replacement(files)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise SystemExit('Switchyard controller stopped: ' + str(error)) from None
+    print('Switchyard ' + ('enabled' if settings is not None else 'disabled') +
+          '; Praxis restarted after readiness checks. Existing provider settings were not changed.')
+
+
+if __name__ == '__main__':
+    main()
